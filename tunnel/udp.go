@@ -4,89 +4,31 @@ import (
 	"errors"
 	"net"
 	"sync"
-	"time"
 )
 
-type UdpPeer struct {
-	addr     *net.UDPAddr
-	lastSeen time.Time
-
-	tunnel *UdpTunnel
-	in     chan []byte
-	done   chan struct{}
-	once   sync.Once
-}
-
-func NewUdpPeer(addr *net.UDPAddr) *UdpPeer {
-	return &UdpPeer{
-		addr: addr,
-		in:   make(chan []byte, 16), // 可配置
-		done: make(chan struct{}),
-	}
-}
-
-func (u *UdpPeer) Done() <-chan struct{} {
-	return u.done
-}
-
-func (u *UdpPeer) Read() ([]byte, error) {
-	select {
-	case <-u.done:
-		return nil, ErrClosed
-	case b, ok := <-u.in:
-		if !ok {
-			return nil, ErrClosed
-		}
-		u.lastSeen = time.Now()
-		return b, nil
-	}
-}
-
-func (u *UdpPeer) Put(b []byte) {
-	if u.tunnel != nil {
-		u.tunnel.bufpool.Put(b)
-		return
-	}
-	// 没有 tunnel 时安全丢弃
-}
-
-func (u *UdpPeer) Send(data []byte) (int, error) {
-	return u.tunnel.conn.WriteToUDP(data, u.addr)
-}
-
-func (u *UdpPeer) Close() error {
-	u.once.Do(func() { close(u.done) })
-	return nil
-}
-
-func (u *UdpPeer) LastSeen() time.Time {
-	return u.lastSeen
-}
-
-func (u *UdpPeer) Type() Tunnel {
-	return u.tunnel
-}
-
 type UdpTunnel struct {
-	BufSize int
+	localAddr *net.UDPAddr //UDP local listen address
 
-	localAddr *net.UDPAddr
-
-	conn    *net.UDPConn
+	conn    *net.UDPConn //UDP instance
 	closed  chan struct{}
-	bufpool *sync.Pool
-
-	mu    sync.RWMutex
-	peers map[string]*UdpPeer
+	BufPool *sync.Pool //Buffer pool for reusing byte slices
+	in      chan<- []byte
 }
 
-func NewUdpTunnel(conn *net.UDPConn, bufpool *sync.Pool) *UdpTunnel {
+func (u *UdpTunnel) Done() <-chan struct{} {
+	return u.closed
+}
+
+func (u *UdpTunnel) Type() string {
+	return "UDPTunnel"
+}
+
+func NewUdpTunnel(localAddr *net.UDPAddr, bufPool *sync.Pool, in chan<- []byte) *UdpTunnel {
 	return &UdpTunnel{
-		BufSize: 2048,
-		conn:    conn,
-		closed:  make(chan struct{}),
-		bufpool: bufpool,
-		peers:   make(map[string]*UdpPeer),
+		localAddr: localAddr,
+		closed:    make(chan struct{}),
+		BufPool:   bufPool,
+		in:        in,
 	}
 }
 
@@ -107,26 +49,18 @@ func (u *UdpTunnel) Start() error {
 			break
 		default:
 		}
-		buffer := u.bufpool.Get().([]byte)
+		buffer := u.BufPool.Get().([]byte)
 		n, addr, err := u.conn.ReadFromUDP(buffer)
 		if err != nil {
-			u.bufpool.Put(buffer)
+			u.BufPool.Put(buffer)
 			continue
 		}
 		// Process data from addr
 		go func(buffer []byte, n int, addr *net.UDPAddr) {
-			peer, has := u.peers[addr.String()]
-			if !has {
-				//TODO: add peer management
-				//auth here if needed
-				//if auth passed,add peer
-
-				u.bufpool.Put(buffer)
-			}
 			select {
-			case peer.in <- buffer:
+			case u.in <- buffer:
 			default:
-				u.bufpool.Put(buffer)
+				u.BufPool.Put(buffer)
 			}
 		}(buffer, n, addr)
 	}
@@ -137,14 +71,18 @@ func (u *UdpTunnel) Stop() error {
 	return u.conn.Close()
 }
 
-func (u *UdpTunnel) GetPeerList() []Peer {
-	u.mu.RLock()
-	defer u.mu.RUnlock()
-
-	// 创建一个新的 map 用于返回
-	peers := make([]Peer, 0, len(u.peers))
-	for _, v := range u.peers {
-		peers = append(peers, v)
-	}
-	return peers
+func (u *UdpTunnel) Put(data []byte) {
+	u.BufPool.Put(data)
 }
+
+//func (u *UdpTunnel) GetPeerList() []Peer {
+//	u.mu.RLock()
+//	defer u.mu.RUnlock()
+//
+//	// 创建一个新的 map 用于返回
+//	peers := make([]Peer, 0, len(u.peers))
+//	for _, v := range u.peers {
+//		peers = append(peers, v)
+//	}
+//	return peers
+//}
